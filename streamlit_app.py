@@ -1,5 +1,5 @@
 import streamlit as st
 
-st.title('🎈 App Name')
+st.title('🎈cdu predictor')
 
-st.write('Hello world!')
+st.write('this is a crude distilatio column predictor')
