@@ -9,7 +9,7 @@ from lightgbm import LGBMRegressor
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
 st.title('cdu predictor')
-st.write('this is a crude distilatio column predictor')
+st.write('crude distilation column predictor')
 
 # --- App Config ---
 st.set_page_config(page_title="CDU Cut & Yield Predictor", layout="wide")
