@@ -56,7 +56,9 @@ if page == "1. Model Training & DCS Upload":
             n_samples = 1200
             crude_flow = np.random.uniform(350, 450, n_samples)
             cot = np.random.uniform(345, 375, n_samples)
-            api = np.random.uniform(28, 36, n_samples)
+            oil_density = np.random.uniform(873.2, 875.3, n_samples)
+            sg = oil_density/999.016
+            api = ((141.5/sg)-131.5)
             sulfur = np.random.uniform(1.2, 2.8, n_samples)
             fzp = np.random.uniform(1.2, 1.6, n_samples)
             steam = np.random.uniform(8, 14, n_samples)
