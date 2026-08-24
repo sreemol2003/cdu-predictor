@@ -8,13 +8,19 @@ from sklearn.preprocessing import StandardScaler
 from lightgbm import LGBMRegressor
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
-st.title('cdu predictor')
-st.write('crude distilation column predictor')
 
 # --- App Config ---
 st.set_page_config(page_title="CDU Cut & Yield Predictor", layout="wide")
 os.makedirs("models", exist_ok=True)
 MODEL_FILE = "models/cdu_model_pipeline.pkl"
+
+# Density to API Conversion Helper
+def density_to_api(density_val):
+    # Handles density in kg/m3 (e.g., 850) or g/cm3 / SG (e.g., 0.850)
+    sg = density_val / 1000.0 if density_val > 10.0 else density_val
+    if sg <= 0:
+        return 30.0
+    return (141.5 / sg) - 131.5
 
 DEFAULT_FEATURES = [
     'crude_flow', 'crude_api', 'sulfur_wt_pct',
@@ -36,9 +42,8 @@ page = st.sidebar.radio("Navigation", ["1. Model Training & DCS Upload", "2. Rea
 # ==============================================================================
 if page == "1. Model Training & DCS Upload":
     st.header("⚙️ Column Data Ingestion & Model Training")
-    st.markdown("Upload your CDU DCS dataset (CSV/Excel) with operating parameters and outlet flows.")
+    st.markdown("Upload your CDU DCS dataset with operating parameters, crude density/API, and outlet flows.")
 
-    # Generate or upload dataset
     uploaded_file = st.file_uploader("Upload DCS Historical Data", type=["csv", "xlsx"])
     
     col1, col2 = st.columns([1, 4])
@@ -51,14 +56,13 @@ if page == "1. Model Training & DCS Upload":
             else:
                 df = pd.read_excel(uploaded_file)
         else:
-            # Generate synthetic plant dataset
+            # Generate synthetic plant dataset using LAGO and Crude Density
             np.random.seed(42)
             n_samples = 1200
             crude_flow = np.random.uniform(350, 450, n_samples)
             cot = np.random.uniform(345, 375, n_samples)
-            oil_density = np.random.uniform(873.2, 875.3, n_samples)
-            sg = oil_density/999.016
-            api = ((141.5/sg)-131.5)
+            crude_density_kg_m3 = np.random.uniform(840, 890, n_samples)  # Density in kg/m3
+            api = (141.5 / (crude_density_kg_m3 / 1000.0)) - 131.5
             sulfur = np.random.uniform(1.2, 2.8, n_samples)
             fzp = np.random.uniform(1.2, 1.6, n_samples)
             steam = np.random.uniform(8, 14, n_samples)
@@ -66,7 +70,7 @@ if page == "1. Model Training & DCS Upload":
             top_t = np.random.uniform(115, 135, n_samples)
             lago_t = np.random.uniform(340, 365, n_samples)
 
-            # Simulated physical cuts (with COT sensitivity)
+            # Simulated physical cuts (with LAGO)
             y_offgas = 0.02 + 0.0003 * (cot - 360) + np.random.normal(0, 0.002, n_samples)
             y_naphtha = 0.16 + 0.0005 * (cot - 360) + np.random.normal(0, 0.005, n_samples)
             y_kero = 0.12 + 0.0002 * (cot - 360) + np.random.normal(0, 0.004, n_samples)
@@ -74,18 +78,37 @@ if page == "1. Model Training & DCS Upload":
             y_residue = 1.0 - (y_offgas + y_naphtha + y_kero + y_lago)
 
             df = pd.DataFrame({
-                'crude_flow': crude_flow, 'crude_api': api, 'sulfur_wt_pct': sulfur,
-                'cot_degC': cot, 'flash_zone_p_kgcm2': fzp, 'stripping_steam_flow': steam,
-                'reflux_ratio': reflux, 'top_temp_degC': top_t, 'lcgo_d86_95_degC': lago_t,
+                'crude_flow': crude_flow,
+                'crude_density': crude_density_kg_m3,
+                'crude_api': api,
+                'sulfur_wt_pct': sulfur,
+                'cot_degC': cot,
+                'flash_zone_p_kgcm2': fzp,
+                'stripping_steam_flow': steam,
+                'reflux_ratio': reflux,
+                'top_temp_degC': top_t,
+                'lago_d86_95_degC': lago_t,
                 'flow_offgas': y_offgas * crude_flow,
                 'flow_naphtha': y_naphtha * crude_flow,
                 'flow_kero': y_kero * crude_flow,
-                'flow_lcgo': y_lago * crude_flow,
+                'flow_lago': y_lago * crude_flow,
                 'flow_residue': y_residue * crude_flow
             })
 
         st.subheader("Data Preview")
         st.dataframe(df.head(5))
+
+        # Automatic Density to API Conversion Check
+        st.subheader("Crude Density / API Configuration")
+        has_density_col = any("dens" in c.lower() or "sg" in c.lower() for c in df.columns)
+        convert_density = st.checkbox("Calculate crude_api automatically from a Density/SG column", value=has_density_col)
+        
+        if convert_density:
+            dens_cols = list(df.columns)
+            selected_dens_col = st.selectbox("Select Crude Density / SG Column", options=dens_cols, index=dens_cols.index('crude_density') if 'crude_density' in dens_cols else 0)
+            # Calculate API and insert into dataframe
+            df['crude_api'] = df[selected_dens_col].apply(density_to_api)
+            st.success(f"Calculated `crude_api` from `{selected_dens_col}` (Sample: {df['crude_api'].iloc[0]:.2f} °API)")
 
         st.subheader("Column Mapping")
         c1, c2 = st.columns(2)
@@ -95,12 +118,12 @@ if page == "1. Model Training & DCS Upload":
 
         if st.button("🚀 Train Model", type="primary"):
             with st.spinner("Reconciling mass balances and training model..."):
-                # 1. Mass Reconciliation Filter (<3% error)
+                # Mass Reconciliation Filter (<3% error)
                 total_out = df[target_cols].sum(axis=1)
                 imbalance = np.abs(total_out - df[crude_flow_col]) / df[crude_flow_col]
                 valid_df = df[imbalance < 0.03].copy()
 
-                # 2. Compute Yield Fractions (y_i = flow_i / crude_in)
+                # Compute Yield Fractions
                 yield_targets = valid_df[target_cols].div(valid_df[crude_flow_col], axis=0)
                 
                 X = valid_df[feature_cols]
@@ -110,7 +133,6 @@ if page == "1. Model Training & DCS Upload":
                     X, y, valid_df[crude_flow_col], test_size=0.2, random_state=42
                 )
 
-                # 3. Fit Scaler & Regressor
                 scaler = StandardScaler()
                 X_train_scaled = scaler.fit_transform(X_train)
                 X_test_scaled = scaler.transform(X_test)
@@ -119,14 +141,13 @@ if page == "1. Model Training & DCS Upload":
                 multi_model = MultiOutputRegressor(base_reg)
                 multi_model.fit(X_train_scaled, y_train)
 
-                # 4. Evaluate Test Metrics
+                # Evaluate Metrics
                 raw_yield_preds = multi_model.predict(X_test_scaled)
-                # Normalize yields to sum to 1.0 (Mass Conservation)
                 norm_yield_preds = raw_yield_preds / raw_yield_preds.sum(axis=1, keepdims=True)
                 pred_flows = norm_yield_preds * crude_test.values.reshape(-1, 1)
                 actual_flows = (y_test.values * crude_test.values.reshape(-1, 1))
 
-                # Save Artifacts
+                # Save Pipeline
                 pipeline = {
                     "model": multi_model,
                     "scaler": scaler,
@@ -135,9 +156,9 @@ if page == "1. Model Training & DCS Upload":
                     "crude_col": crude_flow_col
                 }
                 joblib.dump(pipeline, MODEL_FILE)
-                st.success("Model trained and saved successfully!")
+                st.success("Model trained and saved successfully with LAGO targets!")
 
-                # Display Metrics
+                # Performance Display
                 st.subheader("📊 Performance Metrics on Test Set")
                 metrics = []
                 for i, col in enumerate(target_cols):
@@ -150,7 +171,7 @@ if page == "1. Model Training & DCS Upload":
 # PAGE 2: PREDICTION INTERFACE
 # ==============================================================================
 elif page == "2. Real-Time Yield Prediction":
-    st.header("🎯 CDU Cut Flow & Recovery Predictor")
+    st.header("🎯 CDU Cut Flow & LAGO Recovery Predictor")
 
     if not os.path.exists(MODEL_FILE):
         st.warning("⚠️ No trained model found. Please train the model on the '1. Model Training' page first.")
@@ -159,16 +180,27 @@ elif page == "2. Real-Time Yield Prediction":
         features = pipeline["features"]
         targets = pipeline["targets"]
 
-        st.subheader("Set Operating Parameters & Assay Properties")
+        st.subheader("Crude Density Input & API Auto-Calculation")
+        c_dens1, c_dens2 = st.columns(2)
+        
+        # User provides Density/SG, API is calculated automatically
+        input_density = c_dens1.number_input("Crude Density (kg/m³ or SG @ 15°C)", value=850.0, format="%.2f")
+        calculated_api = density_to_api(input_density)
+        c_dens2.metric("Calculated Crude API", f"{calculated_api:.2f} °API")
+
+        st.subheader("Set Operating Parameters & Target Cuts")
         
         # Build interactive inputs dynamically
         input_data = {}
         cols = st.columns(3)
         for i, feat in enumerate(features):
             col = cols[i % 3]
-            # Default values heuristic
-            default_val = 360.0 if "cot" in feat.lower() else (400.0 if "flow" in feat.lower() else 30.0)
-            input_data[feat] = col.number_input(f"{feat}", value=float(default_val), format="%.2f")
+            if feat == 'crude_api':
+                # Auto-assign calculated API
+                input_data[feat] = calculated_api
+            else:
+                default_val = 360.0 if "cot" in feat.lower() else (400.0 if "flow" in feat.lower() else 30.0)
+                input_data[feat] = col.number_input(f"{feat}", value=float(default_val), format="%.2f")
 
         if st.button("🔮 Predict Outlet Flows", type="primary"):
             input_df = pd.DataFrame([input_data])
