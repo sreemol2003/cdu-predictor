@@ -19,12 +19,12 @@ MODEL_FILE = "models/cdu_model_pipeline.pkl"
 DEFAULT_FEATURES = [
     'crude_flow', 'crude_api', 'sulfur_wt_pct',
     'cot_degC', 'flash_zone_p_kgcm2', 'stripping_steam_flow',
-    'reflux_ratio', 'top_temp_degC', 'lcgo_d86_95_degC'
+    'reflux_ratio', 'top_temp_degC', 'lago_d86_95_degC'
 ]
 
 DEFAULT_TARGETS = [
     'flow_offgas', 'flow_naphtha', 'flow_kero', 
-    'flow_lcgo', 'flow_residue'
+    'flow_lago', 'flow_residue'
 ]
 
 # --- Sidebar Navigation ---
@@ -64,23 +64,23 @@ if page == "1. Model Training & DCS Upload":
             steam = np.random.uniform(8, 14, n_samples)
             reflux = np.random.uniform(1.5, 3.0, n_samples)
             top_t = np.random.uniform(115, 135, n_samples)
-            lcgo_t = np.random.uniform(340, 365, n_samples)
+            lago_t = np.random.uniform(340, 365, n_samples)
 
             # Simulated physical cuts (with COT sensitivity)
             y_offgas = 0.02 + 0.0003 * (cot - 360) + np.random.normal(0, 0.002, n_samples)
             y_naphtha = 0.16 + 0.0005 * (cot - 360) + np.random.normal(0, 0.005, n_samples)
             y_kero = 0.12 + 0.0002 * (cot - 360) + np.random.normal(0, 0.004, n_samples)
-            y_lcgo = 0.28 + 0.0012 * (cot - 360) + np.random.normal(0, 0.006, n_samples)
-            y_residue = 1.0 - (y_offgas + y_naphtha + y_kero + y_lcgo)
+            y_lago = 0.28 + 0.0012 * (cot - 360) + np.random.normal(0, 0.006, n_samples)
+            y_residue = 1.0 - (y_offgas + y_naphtha + y_kero + y_lago)
 
             df = pd.DataFrame({
                 'crude_flow': crude_flow, 'crude_api': api, 'sulfur_wt_pct': sulfur,
                 'cot_degC': cot, 'flash_zone_p_kgcm2': fzp, 'stripping_steam_flow': steam,
-                'reflux_ratio': reflux, 'top_temp_degC': top_t, 'lcgo_d86_95_degC': lcgo_t,
+                'reflux_ratio': reflux, 'top_temp_degC': top_t, 'lcgo_d86_95_degC': lago_t,
                 'flow_offgas': y_offgas * crude_flow,
                 'flow_naphtha': y_naphtha * crude_flow,
                 'flow_kero': y_kero * crude_flow,
-                'flow_lcgo': y_lcgo * crude_flow,
+                'flow_lcgo': y_lago * crude_flow,
                 'flow_residue': y_residue * crude_flow
             })
 
