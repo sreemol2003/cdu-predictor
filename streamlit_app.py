@@ -16,16 +16,17 @@ MODEL_FILE = "models/cdu_model_pipeline.pkl"
 
 # Density to API Conversion Helper
 def density_to_api(density_val):
-    # Handles density in kg/m3 (e.g., 850) or g/cm3 / SG (e.g., 0.850)
     sg = density_val / 1000.0 if density_val > 10.0 else density_val
     if sg <= 0:
         return 30.0
     return (141.5 / sg) - 131.5
 
+# Standard industrial DCS feature set for atmospheric columns
 DEFAULT_FEATURES = [
     'crude_flow', 'crude_api', 'sulfur_wt_pct',
     'cot_degC', 'flash_zone_p_kgcm2', 'stripping_steam_flow',
-    'reflux_ratio', 'top_temp_degC', 'lago_d86_95_degC'
+    'top_reflux_flow_tph', 'kero_pa_flow_tph', 'lago_pa_flow_tph',
+    'top_temp_degC', 'lago_d86_95_degC'
 ]
 
 DEFAULT_TARGETS = [
@@ -42,7 +43,7 @@ page = st.sidebar.radio("Navigation", ["1. Model Training & DCS Upload", "2. Rea
 # ==============================================================================
 if page == "1. Model Training & DCS Upload":
     st.header("⚙️ Column Data Ingestion & Model Training")
-    st.markdown("Upload your CDU DCS dataset with operating parameters, crude density/API, and outlet flows.")
+    st.markdown("Upload your CDU DCS dataset with operating parameters, pumparound flow rates, and outlet cuts.")
 
     uploaded_file = st.file_uploader("Upload DCS Historical Data", type=["csv", "xlsx"])
     
@@ -56,21 +57,26 @@ if page == "1. Model Training & DCS Upload":
             else:
                 df = pd.read_excel(uploaded_file)
         else:
-            # Generate synthetic plant dataset using LAGO and Crude Density
+            # Generate synthetic plant dataset using Top Reflux & Pumparound flows
             np.random.seed(42)
             n_samples = 1200
             crude_flow = np.random.uniform(350, 450, n_samples)
             cot = np.random.uniform(345, 375, n_samples)
-            crude_density_kg_m3 = np.random.uniform(840, 890, n_samples)  # Density in kg/m3
-            api = (141.5 / (crude_density_kg_m3 / 1000.0)) - 131.5
+            crude_density = np.random.uniform(840, 890, n_samples)  # kg/m3
+            api = (141.5 / (crude_density / 1000.0)) - 131.5
             sulfur = np.random.uniform(1.2, 2.8, n_samples)
             fzp = np.random.uniform(1.2, 1.6, n_samples)
             steam = np.random.uniform(8, 14, n_samples)
-            reflux = np.random.uniform(1.5, 3.0, n_samples)
+            
+            # Plant reflux & pumparound circulation flows (t/h)
+            top_reflux_flow = np.random.uniform(40, 75, n_samples)
+            kero_pa_flow = np.random.uniform(80, 140, n_samples)
+            lago_pa_flow = np.random.uniform(110, 190, n_samples)
+            
             top_t = np.random.uniform(115, 135, n_samples)
             lago_t = np.random.uniform(340, 365, n_samples)
 
-            # Simulated physical cuts (with LAGO)
+            # Simulated physical cuts
             y_offgas = 0.02 + 0.0003 * (cot - 360) + np.random.normal(0, 0.002, n_samples)
             y_naphtha = 0.16 + 0.0005 * (cot - 360) + np.random.normal(0, 0.005, n_samples)
             y_kero = 0.12 + 0.0002 * (cot - 360) + np.random.normal(0, 0.004, n_samples)
@@ -79,13 +85,15 @@ if page == "1. Model Training & DCS Upload":
 
             df = pd.DataFrame({
                 'crude_flow': crude_flow,
-                'crude_density': crude_density_kg_m3,
+                'crude_density': crude_density,
                 'crude_api': api,
                 'sulfur_wt_pct': sulfur,
                 'cot_degC': cot,
                 'flash_zone_p_kgcm2': fzp,
                 'stripping_steam_flow': steam,
-                'reflux_ratio': reflux,
+                'top_reflux_flow_tph': top_reflux_flow,
+                'kero_pa_flow_tph': kero_pa_flow,
+                'lago_pa_flow_tph': lago_pa_flow,
                 'top_temp_degC': top_t,
                 'lago_d86_95_degC': lago_t,
                 'flow_offgas': y_offgas * crude_flow,
@@ -98,7 +106,7 @@ if page == "1. Model Training & DCS Upload":
         st.subheader("Data Preview")
         st.dataframe(df.head(5))
 
-        # Automatic Density to API Conversion Check
+        # Density to API Conversion Check
         st.subheader("Crude Density / API Configuration")
         has_density_col = any("dens" in c.lower() or "sg" in c.lower() for c in df.columns)
         convert_density = st.checkbox("Calculate crude_api automatically from a Density/SG column", value=has_density_col)
@@ -106,7 +114,6 @@ if page == "1. Model Training & DCS Upload":
         if convert_density:
             dens_cols = list(df.columns)
             selected_dens_col = st.selectbox("Select Crude Density / SG Column", options=dens_cols, index=dens_cols.index('crude_density') if 'crude_density' in dens_cols else 0)
-            # Calculate API and insert into dataframe
             df['crude_api'] = df[selected_dens_col].apply(density_to_api)
             st.success(f"Calculated `crude_api` from `{selected_dens_col}` (Sample: {df['crude_api'].iloc[0]:.2f} °API)")
 
@@ -156,7 +163,7 @@ if page == "1. Model Training & DCS Upload":
                     "crude_col": crude_flow_col
                 }
                 joblib.dump(pipeline, MODEL_FILE)
-                st.success("Model trained and saved successfully with LAGO targets!")
+                st.success("Model trained and saved successfully with Pumparound dynamics!")
 
                 # Performance Display
                 st.subheader("📊 Performance Metrics on Test Set")
@@ -183,23 +190,20 @@ elif page == "2. Real-Time Yield Prediction":
         st.subheader("Crude Density Input & API Auto-Calculation")
         c_dens1, c_dens2 = st.columns(2)
         
-        # User provides Density/SG, API is calculated automatically
         input_density = c_dens1.number_input("Crude Density (kg/m³ or SG @ 15°C)", value=850.0, format="%.2f")
         calculated_api = density_to_api(input_density)
         c_dens2.metric("Calculated Crude API", f"{calculated_api:.2f} °API")
 
-        st.subheader("Set Operating Parameters & Target Cuts")
+        st.subheader("Set Operating Parameters & Pumparound Rates")
         
-        # Build interactive inputs dynamically
         input_data = {}
         cols = st.columns(3)
         for i, feat in enumerate(features):
             col = cols[i % 3]
             if feat == 'crude_api':
-                # Auto-assign calculated API
                 input_data[feat] = calculated_api
             else:
-                default_val = 360.0 if "cot" in feat.lower() else (400.0 if "flow" in feat.lower() else 30.0)
+                default_val = 360.0 if "cot" in feat.lower() else (400.0 if "flow" in feat.lower() and "pa" not in feat.lower() else (100.0 if "pa" in feat.lower() else 30.0))
                 input_data[feat] = col.number_input(f"{feat}", value=float(default_val), format="%.2f")
 
         if st.button("🔮 Predict Outlet Flows", type="primary"):
