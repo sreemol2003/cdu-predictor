@@ -21,7 +21,6 @@ def density_to_api(density_val):
         return 30.0
     return (141.5 / sg) - 131.5
 
-# Standard industrial DCS feature set for atmospheric columns
 DEFAULT_FEATURES = [
     'crude_flow', 'crude_api', 'sulfur_wt_pct',
     'cot_degC', 'flash_zone_p_kgcm2', 'stripping_steam_flow',
@@ -57,26 +56,21 @@ if page == "1. Model Training & DCS Upload":
             else:
                 df = pd.read_excel(uploaded_file)
         else:
-            # Generate synthetic plant dataset using Top Reflux & Pumparound flows
             np.random.seed(42)
             n_samples = 1200
             crude_flow = np.random.uniform(350, 450, n_samples)
             cot = np.random.uniform(345, 375, n_samples)
-            crude_density = np.random.uniform(840, 890, n_samples)  # kg/m3
+            crude_density = np.random.uniform(840, 890, n_samples)
             api = (141.5 / (crude_density / 1000.0)) - 131.5
             sulfur = np.random.uniform(1.2, 2.8, n_samples)
             fzp = np.random.uniform(1.2, 1.6, n_samples)
             steam = np.random.uniform(8, 14, n_samples)
-            
-            # Plant reflux & pumparound circulation flows (t/h)
             top_reflux_flow = np.random.uniform(40, 75, n_samples)
             kero_pa_flow = np.random.uniform(80, 140, n_samples)
             lago_pa_flow = np.random.uniform(110, 190, n_samples)
-            
             top_t = np.random.uniform(115, 135, n_samples)
             lago_t = np.random.uniform(340, 365, n_samples)
 
-            # Simulated physical cuts
             y_offgas = 0.02 + 0.0003 * (cot - 360) + np.random.normal(0, 0.002, n_samples)
             y_naphtha = 0.16 + 0.0005 * (cot - 360) + np.random.normal(0, 0.005, n_samples)
             y_kero = 0.12 + 0.0002 * (cot - 360) + np.random.normal(0, 0.004, n_samples)
@@ -106,7 +100,6 @@ if page == "1. Model Training & DCS Upload":
         st.subheader("Data Preview")
         st.dataframe(df.head(5))
 
-        # Density to API Conversion Check
         st.subheader("Crude Density / API Configuration")
         has_density_col = any("dens" in c.lower() or "sg" in c.lower() for c in df.columns)
         convert_density = st.checkbox("Calculate crude_api automatically from a Density/SG column", value=has_density_col)
@@ -125,10 +118,27 @@ if page == "1. Model Training & DCS Upload":
 
         if st.button("🚀 Train Model", type="primary"):
             with st.spinner("Reconciling mass balances and training model..."):
-                # Mass Reconciliation Filter (<3% error)
-                total_out = df[target_cols].sum(axis=1)
-                imbalance = np.abs(total_out - df[crude_flow_col]) / df[crude_flow_col]
-                valid_df = df[imbalance < 0.03].copy()
+                # Clean and coerce columns to numeric
+                all_needed_cols = list(set(feature_cols + target_cols + [crude_flow_col]))
+                train_df = df[all_needed_cols].copy()
+
+                for col in all_needed_cols:
+                    train_df[col] = pd.to_numeric(train_df[col], errors='coerce')
+
+                train_df = train_df.dropna()
+
+                if train_df.empty:
+                    st.error("❌ No valid numerical data found. Please check your Excel columns for non-numeric text.")
+                    st.stop()
+
+                # Mass Balance Filter (<3% error)
+                total_out = train_df[target_cols].sum(axis=1)
+                imbalance = np.abs(total_out - train_df[crude_flow_col]) / train_df[crude_flow_col]
+                valid_df = train_df[imbalance < 0.03].copy()
+
+                if valid_df.empty:
+                    st.error("❌ Mass balance error: None of the rows had mass closure within 3%. Ensure all flow columns use the same unit (e.g., t/h).")
+                    st.stop()
 
                 # Compute Yield Fractions
                 yield_targets = valid_df[target_cols].div(valid_df[crude_flow_col], axis=0)
@@ -163,7 +173,7 @@ if page == "1. Model Training & DCS Upload":
                     "crude_col": crude_flow_col
                 }
                 joblib.dump(pipeline, MODEL_FILE)
-                st.success("Model trained and saved successfully with Pumparound dynamics!")
+                st.success("Model trained and saved successfully!")
 
                 # Performance Display
                 st.subheader("📊 Performance Metrics on Test Set")
@@ -210,7 +220,6 @@ elif page == "2. Real-Time Yield Prediction":
             input_df = pd.DataFrame([input_data])
             scaled_input = pipeline["scaler"].transform(input_df)
 
-            # Predict yields and enforce mass conservation
             raw_yields = pipeline["model"].predict(scaled_input)[0]
             raw_yields = np.clip(raw_yields, 0, 1)
             norm_yields = raw_yields / np.sum(raw_yields)
@@ -218,7 +227,6 @@ elif page == "2. Real-Time Yield Prediction":
             crude_in = input_data[pipeline["crude_col"]]
             pred_flows = norm_yields * crude_in
 
-            # Results Display
             st.divider()
             st.subheader("📈 Predicted Outlet Yields & Rates")
 
