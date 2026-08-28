@@ -17,6 +17,15 @@ os.makedirs("data", exist_ok=True)
 MODEL_FILE = "models/cdu_full_twin_pipeline.pkl"
 DATA_FILE = "data/master_cdu_dataset.parquet"
 
+# Physical Engineering Bounds for Atmospheric Cuts (Prevents overestimating Off-Gas / LPG)
+YIELD_BOUNDS = {
+    'flow_offgas': (0.005, 0.040),    # 0.5% to 4.0% of crude
+    'flow_naphtha': (0.080, 0.300),   # 8% to 30%
+    'flow_kero': (0.050, 0.220),      # 5% to 22%
+    'flow_lago': (0.150, 0.420),      # 15% to 42%
+    'flow_residue': (0.250, 0.650)    # 25% to 65%
+}
+
 def density_to_api(density_val):
     sg = density_val / 1000.0 if density_val > 10.0 else density_val
     if sg <= 0:
@@ -58,7 +67,6 @@ def train_and_save_pipeline(train_df, input_cols, flow_target_cols, state_target
     if valid_df.empty:
         return False, "Mass balance error: No rows had mass closure within 3%. Check units across flows.", None
 
-    # Yield calculations
     yield_targets = valid_df[flow_target_cols].div(valid_df[crude_flow_col], axis=0)
     
     X = valid_df[input_cols]
@@ -81,9 +89,14 @@ def train_and_save_pipeline(train_df, input_cols, flow_target_cols, state_target
     model_states = MultiOutputRegressor(LGBMRegressor(n_estimators=250, learning_rate=0.03, random_state=42))
     model_states.fit(X_train_scaled, ys_train)
 
-    # Metrics
+    # 1. Physical Bounding & Normalization on Test Predictions
     raw_yield_preds = model_flows.predict(X_test_scaled)
-    norm_yield_preds = raw_yield_preds / raw_yield_preds.sum(axis=1, keepdims=True)
+    bounded_yield_preds = np.zeros_like(raw_yield_preds)
+    for i, col in enumerate(flow_target_cols):
+        min_val, max_val = YIELD_BOUNDS.get(col, (0.0, 1.0))
+        bounded_yield_preds[:, i] = np.clip(raw_yield_preds[:, i], min_val, max_val)
+
+    norm_yield_preds = bounded_yield_preds / bounded_yield_preds.sum(axis=1, keepdims=True)
     pred_flows = norm_yield_preds * crude_test.values.reshape(-1, 1)
     actual_flows = (yf_test.values * crude_test.values.reshape(-1, 1))
 
@@ -102,7 +115,6 @@ def train_and_save_pipeline(train_df, input_cols, flow_target_cols, state_target
         unit = "°C" if "temp" in col.lower() else "t/h"
         metrics.append({"Target": col, "Category": "Internal State / PA", "R² Score": round(float(r2), 4), "MAE": f"{mae:.2f} {unit}"})
 
-    # Store the latest row of inputs to serve as defaults in the prediction tab
     last_known_inputs = clean_df[input_cols].iloc[-1].to_dict()
 
     pipeline = {
@@ -136,7 +148,6 @@ if page == "1. Model Training & Upload":
     col1, col2 = st.columns([1, 4])
     use_synthetic = col1.button("Load Demo DCS Dataset")
 
-    # Maintain dataframe state in Streamlit session
     if uploaded_file is not None:
         raw_df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
         if any("unnamed" in str(col).lower() for col in raw_df.columns):
@@ -189,7 +200,6 @@ if page == "1. Model Training & Upload":
         with st.expander("🔍 View Complete Raw Dataset"):
             st.dataframe(df)
 
-        # Crude Density / API Auto Conversion
         st.subheader("Crude Density / API Configuration")
         has_density = any("dens" in str(c).lower() or "sg" in str(c).lower() for c in df.columns)
         if st.checkbox("Calculate crude_api automatically from Density/SG column", value=has_density):
@@ -198,7 +208,6 @@ if page == "1. Model Training & Upload":
             df['crude_api'] = df[selected_dens].apply(density_to_api)
             st.success(f"Calculated `crude_api` from `{selected_dens}`")
 
-        # Column Mapping
         st.subheader("Column Mapping")
         c1, c2, c3 = st.columns(3)
         input_cols = c1.multiselect("Minimal Boundary Inputs (X)", options=list(df.columns), default=[c for c in DEFAULT_INPUTS if c in df.columns])
@@ -235,7 +244,6 @@ elif page == "2. Minimal Input Prediction":
         st.subheader("1. Crude Assay Properties")
         c_dens1, c_dens2 = st.columns(2)
         
-        # Pull default density from last known training data if available
         last_api = float(last_inputs.get('crude_api', 32.0))
         default_density = float(141.5 / (last_api + 131.5) * 1000.0) if last_api else 865.0
 
@@ -251,27 +259,30 @@ elif page == "2. Minimal Input Prediction":
             if feat == 'crude_api':
                 input_data[feat] = calculated_api
             else:
-                # Pre-populate using exact last known training/inputted value
                 fallback_val = last_inputs.get(feat, 360.0 if "cot" in feat.lower() else (400.0 if "crude_flow" in feat.lower() else (1.4 if "p_kgcm2" in feat.lower() else 355.0)))
                 input_data[feat] = col.number_input(f"{feat}", value=float(fallback_val), format="%.2f")
 
         if st.button("🔮 Run Simulation & Predict", type="primary"):
-            # Update last known inputs for persistent session memory
             pipeline["last_known_inputs"] = input_data
             joblib.dump(pipeline, MODEL_FILE)
 
             input_df = pd.DataFrame([input_data])
             scaled_input = pipeline["scaler"].transform(input_df)
 
-            # 1. Product Cuts (Normalized)
+            # 1. Raw Prediction & Hard Physical Bounding
             raw_yields = pipeline["model_flows"].predict(scaled_input)[0]
-            raw_yields = np.clip(raw_yields, 0, 1)
-            norm_yields = raw_yields / np.sum(raw_yields)
+            bounded_yields = np.zeros_like(raw_yields)
+            for i, col in enumerate(flow_targets):
+                min_val, max_val = YIELD_BOUNDS.get(col, (0.0, 1.0))
+                bounded_yields[i] = np.clip(raw_yields[i], min_val, max_val)
+
+            # 2. Strict Mass Balance Closure
+            norm_yields = bounded_yields / np.sum(bounded_yields)
 
             crude_in = input_data[pipeline["crude_col"]]
             pred_flows = norm_yields * crude_in
 
-            # 2. Pumparounds & Column Temperatures
+            # 3. Predict Internal Column States
             pred_states = pipeline["model_states"].predict(scaled_input)[0]
 
             st.divider()
@@ -308,7 +319,7 @@ elif page == "3. Model Management & Data Appending":
         pipeline = joblib.load(MODEL_FILE)
         st.subheader("🔍 Active Digital Twin Architecture")
         m1, m2, m3 = st.columns(3)
-        m1.metric("Architecture", "Dual LightGBM Engine")
+        m1.metric("Architecture", "Dual LightGBM Engine (Physically Bounded)")
         m2.metric("Trained Samples", f"{pipeline.get('training_rows', 'N/A')} snapshots")
         m3.metric("Boundary Inputs", f"{len(pipeline['input_cols'])} variables")
 
