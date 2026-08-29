@@ -5,34 +5,35 @@ import os
 import joblib
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import Ridge
 from lightgbm import LGBMRegressor
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
 
 # --- App Config ---
-st.set_page_config(page_title="CDU Hybrid Digital Twin", layout="wide")
+st.set_page_config(page_title="CDU Physics-Informed Digital Twin", layout="wide")
 os.makedirs("models", exist_ok=True)
 os.makedirs("data", exist_ok=True)
 
-MODEL_FILE = "models/cdu_full_twin_pipeline.pkl"
+MODEL_FILE = "models/cdu_pinn_pipeline.pkl"
 DATA_FILE = "data/master_cdu_dataset.parquet"
 
-# Physical Engineering Bounds
+# Physical Hard Clamping Bounds for Distillation Envelopes
 YIELD_BOUNDS = {
-    'flow_offgas': (0.005, 0.050),
-    'flow_naphtha': (0.080, 0.350),
-    'flow_kero': (0.050, 0.250),
-    'flow_lago': (0.120, 0.450),
-    'flow_residue': (0.200, 0.680)
+    'flow_offgas': (0.005, 0.045),
+    'flow_naphtha': (0.080, 0.320),
+    'flow_kero': (0.050, 0.220),
+    'flow_lago': (0.150, 0.420),
+    'flow_residue': (0.220, 0.650)
 }
 
-# Empirical Thermodynamic Sensitivity Slopes (wt% shift per °C effective flash severity)
+# Empirical Thermodynamic Flash Gradients (wt% shift per °C effective flash severity)
 PHYSICS_SLOPES = {
-    'flow_offgas': 0.00010,     # +0.01 wt% / °C
-    'flow_naphtha': 0.00045,    # +0.045 wt% / °C
-    'flow_kero': 0.00030,       # +0.03 wt% / °C
-    'flow_lago': 0.00115,       # +0.115 wt% / °C (LAGO draws deepest from flash vaporization)
-    'flow_residue': -0.00200    # -0.20 wt% / °C (Residue decreases as vaporization increases)
+    'flow_offgas': 0.00012,
+    'flow_naphtha': 0.00045,
+    'flow_kero': 0.00030,
+    'flow_lago': 0.00115,
+    'flow_residue': -0.00202
 }
 
 def density_to_api(density_val):
@@ -40,6 +41,10 @@ def density_to_api(density_val):
     if sg <= 0:
         return 30.0
     return (141.5 / sg) - 131.5
+
+def softmax(x):
+    e_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
+    return e_x / np.sum(e_x, axis=-1, keepdims=True)
 
 DEFAULT_INPUTS = [
     'crude_flow', 'crude_api', 'sulfur_wt_pct',
@@ -57,26 +62,61 @@ DEFAULT_STATE_TARGETS = [
     'top_temp_degC', 'bottom_residue_temp_degC'
 ]
 
-def apply_hybrid_physics(raw_yields, flow_targets, input_data, baseline_cot=350.0, baseline_p=1.40, baseline_steam=10.0):
-    """Adjusts ML baseline yields continuously with thermodynamic temperature and pressure sensitivity."""
-    cot = float(input_data.get('cot_degC', baseline_cot))
-    fzp = float(input_data.get('flash_zone_p_kgcm2', baseline_p))
-    steam = float(input_data.get('stripping_steam_flow', baseline_steam))
+class PhysicsInformedYieldModel:
+    """Hybrid Continuous Physics-ML Ensemble ensuring Smooth Derivatives and Mass Conservation."""
+    def __init__(self):
+        self.ml_model = MultiOutputRegressor(LGBMRegressor(n_estimators=300, learning_rate=0.03, random_state=42))
+        self.linear_reg = Ridge(alpha=1.0)
+        self.scaler = StandardScaler()
+        self.flow_targets = []
+        self.baseline_stats = {}
 
-    # Effective Flash Severity Index
-    delta_severity = (cot - baseline_cot) - 15.0 * (fzp - baseline_p) + 0.5 * (steam - baseline_steam)
-
-    adjusted_yields = np.zeros_like(raw_yields)
-    for i, col in enumerate(flow_targets):
-        slope = PHYSICS_SLOPES.get(col, 0.0)
-        adj_val = raw_yields[i] + (slope * delta_severity)
+    def fit(self, X, y_yields, flow_targets, baseline_stats):
+        self.flow_targets = flow_targets
+        self.baseline_stats = baseline_stats
+        X_scaled = self.scaler.fit_transform(X)
         
-        # Hard physical bounds
-        min_b, max_b = YIELD_BOUNDS.get(col, (0.01, 0.90))
-        adjusted_yields[i] = np.clip(adj_val, min_b, max_b)
+        # Train ML tree component
+        self.ml_model.fit(X_scaled, y_yields)
+        
+        # Train Ridge linear component for robust continuous extrapolation
+        logits = np.log(np.clip(y_yields.values, 1e-4, 1.0))
+        self.linear_reg.fit(X_scaled, logits)
 
-    # Normalize for 100% mass balance closure
-    return adjusted_yields / np.sum(adjusted_yields)
+    def predict(self, X_df):
+        X_scaled = self.scaler.transform(X_df)
+        
+        # 1. Base ML & Continuous Ridge Extrapolation
+        ml_preds = self.ml_model.predict(X_scaled)
+        linear_logits = self.linear_reg.predict(X_scaled)
+        linear_preds = softmax(linear_logits)
+
+        # 2. Ensemble Blend (70% ML Local Precision + 30% Continuous Extrapolation)
+        base_yields = 0.70 * ml_preds + 0.30 * linear_preds
+
+        # 3. Dynamic Flash Severity Adjustment
+        cot = X_df['cot_degC'].values if 'cot_degC' in X_df else self.baseline_stats['mean_cot']
+        fzp = X_df['flash_zone_p_kgcm2'].values if 'flash_zone_p_kgcm2' in X_df else self.baseline_stats['mean_p']
+        steam = X_df['stripping_steam_flow'].values if 'stripping_steam_flow' in X_df else self.baseline_stats['mean_steam']
+        api = X_df['crude_api'].values if 'crude_api' in X_df else self.baseline_stats.get('mean_api', 32.0)
+
+        # Effective Thermodynamic Vaporization Severity
+        delta_severity = (
+            (cot - self.baseline_stats['mean_cot'])
+            - 16.5 * (fzp - self.baseline_stats['mean_p'])
+            + 0.55 * (steam - self.baseline_stats['mean_steam'])
+            + 0.85 * (api - self.baseline_stats.get('mean_api', 32.0))
+        )
+
+        final_yields = np.zeros_like(base_yields)
+        for i, col in enumerate(self.flow_targets):
+            slope = PHYSICS_SLOPES.get(col, 0.0)
+            adj = base_yields[:, i] + (slope * delta_severity)
+            min_b, max_b = YIELD_BOUNDS.get(col, (0.01, 0.90))
+            final_yields[:, i] = np.clip(adj, min_b, max_b)
+
+        # 4. Final Coupled Softmax/Mass Closure
+        return final_yields / np.sum(final_yields, axis=1, keepdims=True)
 
 def train_and_save_pipeline(train_df, input_cols, flow_target_cols, state_target_cols, crude_flow_col):
     all_needed_cols = list(set(input_cols + flow_target_cols + state_target_cols + [crude_flow_col]))
@@ -94,7 +134,7 @@ def train_and_save_pipeline(train_df, input_cols, flow_target_cols, state_target
     valid_df = clean_df[imbalance < 0.05].copy()
 
     if valid_df.empty:
-        return False, "Mass balance error: No rows had mass closure within 5%.", None
+        return False, "Mass balance error: No rows closed within 5%. Check flow units.", None
 
     yield_targets = valid_df[flow_target_cols].div(valid_df[crude_flow_col], axis=0)
     
@@ -106,33 +146,30 @@ def train_and_save_pipeline(train_df, input_cols, flow_target_cols, state_target
         X, y_flows, y_states, valid_df[crude_flow_col], test_size=0.2, random_state=42
     )
 
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
+    baseline_stats = {
+        'mean_cot': float(valid_df['cot_degC'].mean()) if 'cot_degC' in valid_df.columns else 350.0,
+        'mean_p': float(valid_df['flash_zone_p_kgcm2'].mean()) if 'flash_zone_p_kgcm2' in valid_df.columns else 1.40,
+        'mean_steam': float(valid_df['stripping_steam_flow'].mean()) if 'stripping_steam_flow' in valid_df.columns else 10.0,
+        'mean_api': float(valid_df['crude_api'].mean()) if 'crude_api' in valid_df.columns else 32.0
+    }
 
-    # Model 1: Yield Baseline Regressor
-    model_flows = MultiOutputRegressor(LGBMRegressor(n_estimators=300, learning_rate=0.03, random_state=42))
-    model_flows.fit(X_train_scaled, yf_train)
+    # Train Physics-Informed Yield Engine
+    yield_model = PhysicsInformedYieldModel()
+    yield_model.fit(X_train, yf_train, flow_target_cols, baseline_stats)
 
-    # Model 2: State Regressor
+    # Train State & Pumparound Regressor
+    scaler_states = StandardScaler()
+    X_train_s = scaler_states.fit_transform(X_train)
+    X_test_s = scaler_states.transform(X_test)
     model_states = MultiOutputRegressor(LGBMRegressor(n_estimators=300, learning_rate=0.03, random_state=42))
-    model_states.fit(X_train_scaled, ys_train)
+    model_states.fit(X_train_s, ys_train)
 
-    # Validation evaluation with hybrid physics
-    raw_preds = model_flows.predict(X_test_scaled)
-    pred_flows = np.zeros_like(raw_preds)
-    
-    mean_cot = float(valid_df['cot_degC'].mean()) if 'cot_degC' in valid_df.columns else 350.0
-    mean_p = float(valid_df['flash_zone_p_kgcm2'].mean()) if 'flash_zone_p_kgcm2' in valid_df.columns else 1.40
-    mean_steam = float(valid_df['stripping_steam_flow'].mean()) if 'stripping_steam_flow' in valid_df.columns else 10.0
-
-    for r in range(len(X_test)):
-        row_inputs = X_test.iloc[r].to_dict()
-        norm_y = apply_hybrid_physics(raw_preds[r], flow_target_cols, row_inputs, mean_cot, mean_p, mean_steam)
-        pred_flows[r] = norm_y * crude_test.iloc[r]
-
+    # Performance Evaluation on Unseen Test Split
+    norm_yield_preds = yield_model.predict(X_test)
+    pred_flows = norm_yield_preds * crude_test.values.reshape(-1, 1)
     actual_flows = (yf_test.values * crude_test.values.reshape(-1, 1))
-    pred_states = model_states.predict(X_test_scaled)
+
+    pred_states = model_states.predict(X_test_s)
     actual_states = ys_test.values
 
     metrics = []
@@ -150,25 +187,23 @@ def train_and_save_pipeline(train_df, input_cols, flow_target_cols, state_target
     last_known_inputs = clean_df[input_cols].iloc[-1].to_dict()
 
     pipeline = {
-        "model_flows": model_flows,
+        "yield_model": yield_model,
         "model_states": model_states,
-        "scaler": scaler,
+        "scaler_states": scaler_states,
         "input_cols": input_cols,
         "flow_targets": flow_target_cols,
         "state_targets": state_target_cols,
         "crude_col": crude_flow_col,
         "metrics": metrics,
         "training_rows": len(valid_df),
-        "mean_cot": mean_cot,
-        "mean_p": mean_p,
-        "mean_steam": mean_steam,
+        "baseline_stats": baseline_stats,
         "last_known_inputs": last_known_inputs
     }
     joblib.dump(pipeline, MODEL_FILE)
     clean_df.to_parquet(DATA_FILE, index=False)
     return True, "Success", metrics
 
-# --- Navigation ---
+# --- Sidebar Navigation ---
 st.sidebar.title("🛢️ CDU Hybrid Digital Twin")
 page = st.sidebar.radio("Navigation", ["1. Model Training & Upload", "2. Minimal Input Prediction", "3. Model Management & Data Appending"])
 
@@ -176,8 +211,8 @@ page = st.sidebar.radio("Navigation", ["1. Model Training & Upload", "2. Minimal
 # PAGE 1: TRAINING INTERFACE
 # ==============================================================================
 if page == "1. Model Training & Upload":
-    st.header("⚙️ Column Historical Training")
-    st.markdown("Upload your refinery Excel/CSV file to train the physics-guided hybrid AI engine.")
+    st.header("⚙️ Column Historical Training & Ingestion")
+    st.markdown("Train the Physics-Informed Hybrid Ensemble on refinery DCS operating logs.")
 
     uploaded_file = st.file_uploader("Upload DCS Historical Data (CSV or Excel)", type=["csv", "xlsx"])
     col1, col2 = st.columns([1, 4])
@@ -208,7 +243,7 @@ if page == "1. Model Training & Upload":
         top_t = 120 + 0.15 * (cot - 360) + np.random.normal(0, 1.5, n_samples)
         btm_t = 338 + 0.65 * (cot - 360) - 0.4 * (steam - 10) + np.random.normal(0, 2, n_samples)
 
-        y_offgas = 0.02 + 0.00010 * (cot - 360) + np.random.normal(0, 0.001, n_samples)
+        y_offgas = 0.02 + 0.00012 * (cot - 360) + np.random.normal(0, 0.001, n_samples)
         y_naphtha = 0.16 + 0.00045 * (cot - 360) + np.random.normal(0, 0.003, n_samples)
         y_kero = 0.12 + 0.00030 * (cot - 360) + np.random.normal(0, 0.003, n_samples)
         y_lago = 0.28 + 0.00115 * (cot - 360) + np.random.normal(0, 0.004, n_samples)
@@ -247,22 +282,22 @@ if page == "1. Model Training & Upload":
         state_target_cols = c3.multiselect("Internal States / PA / Temps (Y2)", options=list(df.columns), default=[c for c in DEFAULT_STATE_TARGETS if c in df.columns])
         crude_flow_col = c1.selectbox("Crude Inlet Flow Tag", options=list(df.columns), index=list(df.columns).index('crude_flow') if 'crude_flow' in df.columns else 0)
 
-        if st.button("🚀 Train Hybrid Model", type="primary"):
-            with st.spinner("Training predictive models with thermodynamic gradients..."):
+        if st.button("🚀 Train Physics-Informed Model", type="primary"):
+            with st.spinner("Training Physics-Informed Multi-Output Ensemble..."):
                 success, msg, metrics = train_and_save_pipeline(df, input_cols, flow_target_cols, state_target_cols, crude_flow_col)
                 if success:
-                    st.success("Hybrid Digital Twin trained and saved successfully!")
+                    st.success("Physics-Informed Digital Twin trained and saved successfully!")
                     st.subheader("📊 Performance Metrics on Validation Set")
                     st.table(pd.DataFrame(metrics))
                 else:
                     st.error(f"❌ {msg}")
 
 # ==============================================================================
-# PAGE 2: PREDICTION INTERFACE (DYNAMIC COT RESPONSE)
+# PAGE 2: PREDICTION INTERFACE (CONTINUOUS PHYSICS SIMULATION)
 # ==============================================================================
 elif page == "2. Minimal Input Prediction":
     st.header("🎯 Autonomous CDU Prediction & Dynamic Sensitivity")
-    st.markdown("Adjust furnace COT, Flash Zone Pressure, or feed rates to see real-time shifts in cut recovery.")
+    st.markdown("Adjust furnace COT, Flash Zone Pressure, or feed rates to see real-time continuous shifts in cut recovery.")
 
     if not os.path.exists(MODEL_FILE):
         st.warning("⚠️ No trained model found. Please train a model on Page 1 first.")
@@ -272,6 +307,7 @@ elif page == "2. Minimal Input Prediction":
         flow_targets = pipeline["flow_targets"]
         state_targets = pipeline["state_targets"]
         last_inputs = pipeline.get("last_known_inputs", {})
+        baseline_stats = pipeline.get("baseline_stats", {})
 
         st.subheader("1. Crude Assay Properties")
         c_dens1, c_dens2 = st.columns(2)
@@ -298,32 +334,25 @@ elif page == "2. Minimal Input Prediction":
             joblib.dump(pipeline, MODEL_FILE)
 
             input_df = pd.DataFrame([input_data])
-            scaled_input = pipeline["scaler"].transform(input_df)
 
-            # 1. Base ML Prediction
-            raw_yields = pipeline["model_flows"].predict(scaled_input)[0]
-
-            # 2. Apply Dynamic Hybrid Physics (COT / Pressure / Steam Gradient)
-            norm_yields = apply_hybrid_physics(
-                raw_yields, flow_targets, input_data,
-                pipeline.get("mean_cot", 350.0),
-                pipeline.get("mean_p", 1.40),
-                pipeline.get("mean_steam", 10.0)
-            )
-
+            # 1. Continuous Physics-Informed Yield Prediction
+            norm_yields = pipeline["yield_model"].predict(input_df)[0]
             crude_in = input_data[pipeline["crude_col"]]
             pred_flows = norm_yields * crude_in
 
-            # 3. Column State Prediction (adjusted for COT)
-            pred_states = pipeline["model_states"].predict(scaled_input)[0]
-            cot_delta = input_data.get('cot_degC', 350.0) - pipeline.get('mean_cot', 350.0)
-            
-            # Dynamic thermal scaling for temperatures and PA heat extraction
+            # 2. Internal Column State Prediction
+            scaled_state_in = pipeline["scaler_states"].transform(input_df)
+            pred_states = pipeline["model_states"].predict(scaled_state_in)[0]
+
+            # Dynamic thermodynamic thermal scaling
+            cot_delta = input_data.get('cot_degC', 350.0) - baseline_stats.get('mean_cot', 350.0)
+            fzp_delta = input_data.get('flash_zone_p_kgcm2', 1.40) - baseline_stats.get('mean_p', 1.40)
+
             for k, s_name in enumerate(state_targets):
                 if "bottom_residue_temp" in s_name.lower():
-                    pred_states[k] += 0.65 * cot_delta
+                    pred_states[k] += 0.65 * cot_delta - 8.0 * fzp_delta
                 elif "top_temp" in s_name.lower():
-                    pred_states[k] += 0.15 * cot_delta
+                    pred_states[k] += 0.15 * cot_delta - 2.5 * fzp_delta
                 elif "pa" in s_name.lower():
                     pred_states[k] += 0.80 * cot_delta
 
@@ -361,9 +390,9 @@ elif page == "3. Model Management & Data Appending":
         pipeline = joblib.load(MODEL_FILE)
         st.subheader("🔍 Active Digital Twin Architecture")
         m1, m2, m3 = st.columns(3)
-        m1.metric("Architecture", "Hybrid Physics-ML Engine")
+        m1.metric("Architecture", "Physics-Informed Hybrid Ensemble (PINN-lite)")
         m2.metric("Trained Samples", f"{pipeline.get('training_rows', 'N/A')} snapshots")
-        m3.metric("Baseline COT Anchor", f"{pipeline.get('mean_cot', 350.0):.1f} °C")
+        m3.metric("Baseline Anchor", f"COT {pipeline['baseline_stats']['mean_cot']:.1f}°C | P {pipeline['baseline_stats']['mean_p']:.2f} kg/cm²")
 
         if pipeline.get("metrics"):
             st.markdown("**Validation Accuracy Breakdown:**")
