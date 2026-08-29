@@ -2,7 +2,9 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import os
+import json
 import joblib
+from datetime import datetime
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import Ridge
@@ -11,11 +13,12 @@ from sklearn.multioutput import MultiOutputRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
 
 # --- App Config ---
-st.set_page_config(page_title="CDU Physics-Informed Digital Twin", layout="wide")
+st.set_page_config(page_title="CDU Hybrid Digital Twin - Multi-Model Registry", layout="wide")
 os.makedirs("models", exist_ok=True)
 os.makedirs("data", exist_ok=True)
 
-MODEL_FILE = "models/cdu_pinn_pipeline.pkl"
+REGISTRY_FILE = "models/model_registry.json"
+ACTIVE_POINTER_FILE = "models/active_model_pointer.json"
 DATA_FILE = "data/master_cdu_dataset.parquet"
 
 # Physical Hard Clamping Bounds for Distillation Envelopes
@@ -27,7 +30,6 @@ YIELD_BOUNDS = {
     'flow_residue': (0.220, 0.650)
 }
 
-# Empirical Thermodynamic Flash Gradients (wt% shift per °C effective flash severity)
 PHYSICS_SLOPES = {
     'flow_offgas': 0.00012,
     'flow_naphtha': 0.00045,
@@ -63,7 +65,6 @@ DEFAULT_STATE_TARGETS = [
 ]
 
 class PhysicsInformedYieldModel:
-    """Hybrid Continuous Physics-ML Ensemble ensuring Smooth Derivatives and Mass Conservation."""
     def __init__(self):
         self.ml_model = MultiOutputRegressor(LGBMRegressor(n_estimators=300, learning_rate=0.03, random_state=42))
         self.linear_reg = Ridge(alpha=1.0)
@@ -75,32 +76,24 @@ class PhysicsInformedYieldModel:
         self.flow_targets = flow_targets
         self.baseline_stats = baseline_stats
         X_scaled = self.scaler.fit_transform(X)
-        
-        # Train ML tree component
         self.ml_model.fit(X_scaled, y_yields)
         
-        # Train Ridge linear component for robust continuous extrapolation
         logits = np.log(np.clip(y_yields.values, 1e-4, 1.0))
         self.linear_reg.fit(X_scaled, logits)
 
     def predict(self, X_df):
         X_scaled = self.scaler.transform(X_df)
-        
-        # 1. Base ML & Continuous Ridge Extrapolation
         ml_preds = self.ml_model.predict(X_scaled)
         linear_logits = self.linear_reg.predict(X_scaled)
         linear_preds = softmax(linear_logits)
 
-        # 2. Ensemble Blend (70% ML Local Precision + 30% Continuous Extrapolation)
         base_yields = 0.70 * ml_preds + 0.30 * linear_preds
 
-        # 3. Dynamic Flash Severity Adjustment
         cot = X_df['cot_degC'].values if 'cot_degC' in X_df else self.baseline_stats['mean_cot']
         fzp = X_df['flash_zone_p_kgcm2'].values if 'flash_zone_p_kgcm2' in X_df else self.baseline_stats['mean_p']
         steam = X_df['stripping_steam_flow'].values if 'stripping_steam_flow' in X_df else self.baseline_stats['mean_steam']
         api = X_df['crude_api'].values if 'crude_api' in X_df else self.baseline_stats.get('mean_api', 32.0)
 
-        # Effective Thermodynamic Vaporization Severity
         delta_severity = (
             (cot - self.baseline_stats['mean_cot'])
             - 16.5 * (fzp - self.baseline_stats['mean_p'])
@@ -115,10 +108,30 @@ class PhysicsInformedYieldModel:
             min_b, max_b = YIELD_BOUNDS.get(col, (0.01, 0.90))
             final_yields[:, i] = np.clip(adj, min_b, max_b)
 
-        # 4. Final Coupled Softmax/Mass Closure
         return final_yields / np.sum(final_yields, axis=1, keepdims=True)
 
-def train_and_save_pipeline(train_df, input_cols, flow_target_cols, state_target_cols, crude_flow_col):
+def load_registry():
+    if os.path.exists(REGISTRY_FILE):
+        with open(REGISTRY_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+def save_registry(registry):
+    with open(REGISTRY_FILE, "w") as f:
+        json.dump(registry, f, indent=4)
+
+def get_active_model_path():
+    if os.path.exists(ACTIVE_POINTER_FILE):
+        with open(ACTIVE_POINTER_FILE, "r") as f:
+            data = json.load(f)
+            return data.get("active_path", None)
+    return None
+
+def set_active_model_path(path):
+    with open(ACTIVE_POINTER_FILE, "w") as f:
+        json.dump({"active_path": path}, f)
+
+def train_and_save_pipeline(train_df, input_cols, flow_target_cols, state_target_cols, crude_flow_col, version_tag):
     all_needed_cols = list(set(input_cols + flow_target_cols + state_target_cols + [crude_flow_col]))
     clean_df = train_df[all_needed_cols].copy()
     
@@ -153,18 +166,15 @@ def train_and_save_pipeline(train_df, input_cols, flow_target_cols, state_target
         'mean_api': float(valid_df['crude_api'].mean()) if 'crude_api' in valid_df.columns else 32.0
     }
 
-    # Train Physics-Informed Yield Engine
     yield_model = PhysicsInformedYieldModel()
     yield_model.fit(X_train, yf_train, flow_target_cols, baseline_stats)
 
-    # Train State & Pumparound Regressor
     scaler_states = StandardScaler()
     X_train_s = scaler_states.fit_transform(X_train)
     X_test_s = scaler_states.transform(X_test)
     model_states = MultiOutputRegressor(LGBMRegressor(n_estimators=300, learning_rate=0.03, random_state=42))
     model_states.fit(X_train_s, ys_train)
 
-    # Performance Evaluation on Unseen Test Split
     norm_yield_preds = yield_model.predict(X_test)
     pred_flows = norm_yield_preds * crude_test.values.reshape(-1, 1)
     actual_flows = (yf_test.values * crude_test.values.reshape(-1, 1))
@@ -172,19 +182,16 @@ def train_and_save_pipeline(train_df, input_cols, flow_target_cols, state_target
     pred_states = model_states.predict(X_test_s)
     actual_states = ys_test.values
 
-    metrics = []
+    metrics_summary = {}
     for i, col in enumerate(flow_target_cols):
         r2 = r2_score(actual_flows[:, i], pred_flows[:, i])
-        mae = mean_absolute_error(actual_flows[:, i], pred_flows[:, i])
-        metrics.append({"Target": col, "Category": "Product Stream", "R² Score": round(float(r2), 4), "MAE": f"{mae:.2f} t/h"})
-
-    for i, col in enumerate(state_target_cols):
-        r2 = r2_score(actual_states[:, i], pred_states[:, i])
-        mae = mean_absolute_error(actual_states[:, i], pred_states[:, i])
-        unit = "°C" if "temp" in col.lower() else "t/h"
-        metrics.append({"Target": col, "Category": "Internal State / PA", "R² Score": round(float(r2), 4), "MAE": f"{mae:.2f} {unit}"})
+        metrics_summary[f"R2_{col}"] = round(float(r2), 4)
 
     last_known_inputs = clean_df[input_cols].iloc[-1].to_dict()
+
+    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_tag = "".join(c if c.isalnum() else "_" for c in version_tag)
+    model_filename = f"models/cdu_model_{safe_tag}_{timestamp_str}.pkl"
 
     pipeline = {
         "yield_model": yield_model,
@@ -194,26 +201,41 @@ def train_and_save_pipeline(train_df, input_cols, flow_target_cols, state_target
         "flow_targets": flow_target_cols,
         "state_targets": state_target_cols,
         "crude_col": crude_flow_col,
-        "metrics": metrics,
         "training_rows": len(valid_df),
         "baseline_stats": baseline_stats,
-        "last_known_inputs": last_known_inputs
+        "last_known_inputs": last_known_inputs,
+        "version_tag": version_tag,
+        "timestamp": timestamp_str
     }
-    joblib.dump(pipeline, MODEL_FILE)
+    joblib.dump(pipeline, model_filename)
     clean_df.to_parquet(DATA_FILE, index=False)
-    return True, "Success", metrics
+
+    # Register model in history log
+    registry = load_registry()
+    registry.append({
+        "version_tag": version_tag,
+        "filename": model_filename,
+        "timestamp": timestamp_str,
+        "training_rows": len(valid_df),
+        "metrics": metrics_summary
+    })
+    save_registry(registry)
+    set_active_model_path(model_filename)
+
+    return True, "Success", model_filename
 
 # --- Sidebar Navigation ---
 st.sidebar.title("🛢️ CDU Hybrid Digital Twin")
-page = st.sidebar.radio("Navigation", ["1. Model Training & Upload", "2. Minimal Input Prediction", "3. Model Management & Data Appending"])
+page = st.sidebar.radio("Navigation", ["1. Model Training & Upload", "2. Minimal Input Prediction", "3. Model Registry & History"])
 
 # ==============================================================================
 # PAGE 1: TRAINING INTERFACE
 # ==============================================================================
 if page == "1. Model Training & Upload":
-    st.header("⚙️ Column Historical Training & Ingestion")
-    st.markdown("Train the Physics-Informed Hybrid Ensemble on refinery DCS operating logs.")
+    st.header("⚙️ Column Historical Training & Versioning")
+    st.markdown("Train and save a new version of the Physics-Informed Hybrid Ensemble.")
 
+    version_tag = st.text_input("Model Version Tag / Name", value="v1.0_baseline")
     uploaded_file = st.file_uploader("Upload DCS Historical Data (CSV or Excel)", type=["csv", "xlsx"])
     col1, col2 = st.columns([1, 4])
     use_synthetic = col1.button("Load Demo DCS Dataset")
@@ -282,27 +304,27 @@ if page == "1. Model Training & Upload":
         state_target_cols = c3.multiselect("Internal States / PA / Temps (Y2)", options=list(df.columns), default=[c for c in DEFAULT_STATE_TARGETS if c in df.columns])
         crude_flow_col = c1.selectbox("Crude Inlet Flow Tag", options=list(df.columns), index=list(df.columns).index('crude_flow') if 'crude_flow' in df.columns else 0)
 
-        if st.button("🚀 Train Physics-Informed Model", type="primary"):
-            with st.spinner("Training Physics-Informed Multi-Output Ensemble..."):
-                success, msg, metrics = train_and_save_pipeline(df, input_cols, flow_target_cols, state_target_cols, crude_flow_col)
+        if st.button("🚀 Train & Save New Model Version", type="primary"):
+            with st.spinner("Training model version..."):
+                success, msg, path = train_and_save_pipeline(df, input_cols, flow_target_cols, state_target_cols, crude_flow_col, version_tag)
                 if success:
-                    st.success("Physics-Informed Digital Twin trained and saved successfully!")
-                    st.subheader("📊 Performance Metrics on Validation Set")
-                    st.table(pd.DataFrame(metrics))
+                    st.success(f"Model version `{version_tag}` trained and registered successfully as `{path}`!")
                 else:
                     st.error(f"❌ {msg}")
 
 # ==============================================================================
-# PAGE 2: PREDICTION INTERFACE (CONTINUOUS PHYSICS SIMULATION)
+# PAGE 2: PREDICTION INTERFACE
 # ==============================================================================
 elif page == "2. Minimal Input Prediction":
     st.header("🎯 Autonomous CDU Prediction & Dynamic Sensitivity")
-    st.markdown("Adjust furnace COT, Flash Zone Pressure, or feed rates to see real-time continuous shifts in cut recovery.")
-
-    if not os.path.exists(MODEL_FILE):
-        st.warning("⚠️ No trained model found. Please train a model on Page 1 first.")
+    
+    active_path = get_active_model_path()
+    if not active_path or not os.path.exists(active_path):
+        st.warning("⚠️ No active model selected or found. Please go to '3. Model Registry & History' to activate a model or train a new one.")
     else:
-        pipeline = joblib.load(MODEL_FILE)
+        pipeline = joblib.load(active_path)
+        st.caption(f"🟢 **Using Active Model:** `{pipeline.get('version_tag', 'Unknown Version')}` (`{active_path}`)")
+
         input_cols = pipeline["input_cols"]
         flow_targets = pipeline["flow_targets"]
         state_targets = pipeline["state_targets"]
@@ -331,20 +353,17 @@ elif page == "2. Minimal Input Prediction":
 
         if st.button("🔮 Run Simulation & Predict", type="primary"):
             pipeline["last_known_inputs"] = input_data
-            joblib.dump(pipeline, MODEL_FILE)
+            joblib.dump(pipeline, active_path)
 
             input_df = pd.DataFrame([input_data])
 
-            # 1. Continuous Physics-Informed Yield Prediction
             norm_yields = pipeline["yield_model"].predict(input_df)[0]
             crude_in = input_data[pipeline["crude_col"]]
             pred_flows = norm_yields * crude_in
 
-            # 2. Internal Column State Prediction
             scaled_state_in = pipeline["scaler_states"].transform(input_df)
             pred_states = pipeline["model_states"].predict(scaled_state_in)[0]
 
-            # Dynamic thermodynamic thermal scaling
             cot_delta = input_data.get('cot_degC', 350.0) - baseline_stats.get('mean_cot', 350.0)
             fzp_delta = input_data.get('flash_zone_p_kgcm2', 1.40) - baseline_stats.get('mean_p', 1.40)
 
@@ -379,24 +398,72 @@ elif page == "2. Minimal Input Prediction":
                 st.table(pd.DataFrame(state_data))
 
 # ==============================================================================
-# PAGE 3: MODEL MANAGEMENT
+# PAGE 3: MODEL REGISTRY & HISTORY
 # ==============================================================================
-elif page == "3. Model Management & Data Appending":
-    st.header("📊 Model Overview & Continuous Learning")
+elif page == "3. Model Registry & History":
+    st.header("📚 Saved Models & Version History")
+    st.markdown("Inspect all trained model versions, switch the active prediction model, or clean up history.")
 
-    if not os.path.exists(MODEL_FILE):
-        st.warning("⚠️ No trained model found. Please train a model on Page 1 first.")
+    registry = load_registry()
+    active_path = get_active_model_path()
+
+    if not registry:
+        st.warning("⚠️ No models registered yet. Train your first model on Page 1.")
     else:
-        pipeline = joblib.load(MODEL_FILE)
-        st.subheader("🔍 Active Digital Twin Architecture")
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Architecture", "Physics-Informed Hybrid Ensemble (PINN-lite)")
-        m2.metric("Trained Samples", f"{pipeline.get('training_rows', 'N/A')} snapshots")
-        m3.metric("Baseline Anchor", f"COT {pipeline['baseline_stats']['mean_cot']:.1f}°C | P {pipeline['baseline_stats']['mean_p']:.2f} kg/cm²")
+        reg_rows = []
+        for idx, item in enumerate(registry):
+            is_active = (item["filename"] == active_path)
+            reg_rows.append({
+                "Index": idx,
+                "Active": "🟢 YES" if is_active else "",
+                "Version Tag": item["version_tag"],
+                "Timestamp": item["timestamp"],
+                "Training Rows": item["training_rows"],
+                "Filename": item["filename"],
+                **item.get("metrics", {})
+            })
 
-        if pipeline.get("metrics"):
-            st.markdown("**Validation Accuracy Breakdown:**")
-            st.table(pd.DataFrame(pipeline["metrics"]))
+        reg_df = pd.DataFrame(reg_rows)
+        st.subheader("Registered Models Table")
+        st.dataframe(reg_df, use_container_width=True)
+
+        st.divider()
+        st.subheader("🛠️ Model Control Actions")
+        
+        col_act1, col_act2 = st.columns(2)
+        
+        with col_act1:
+            selected_idx = st.selectbox("Select Model Index to Activate", options=[r["Index"] for r in reg_rows])
+            if st.button("Activate Selected Model", type="primary"):
+                chosen_model = registry[selected_idx]["filename"]
+                if os.path.exists(chosen_model):
+                    set_active_model_path(chosen_model)
+                    st.success(f"Successfully activated model: `{registry[selected_idx]['version_tag']}`")
+                    st.rerun()
+                else:
+                    st.error("❌ Model file missing from disk.")
+
+        with col_act2:
+            del_idx = st.selectbox("Select Model Index to Delete", options=[r["Index"] for r in reg_rows], key="del_select")
+            if st.button("Delete Selected Model", type="secondary"):
+                target_item = registry[del_idx]
+                file_to_del = target_item["filename"]
+                if os.path.exists(file_to_del):
+                    os.remove(file_to_del)
+                
+                registry.pop(del_idx)
+                save_registry(registry)
+                
+                # If active model was deleted, reset pointer
+                if file_to_del == active_path:
+                    if registry:
+                        set_active_model_path(registry[-1]["filename"])
+                    else:
+                        if os.path.exists(ACTIVE_POINTER_FILE):
+                            os.remove(ACTIVE_POINTER_FILE)
+
+                st.success(f"Deleted model version `{target_item['version_tag']}` successfully!")
+                st.rerun()
 
         if os.path.exists(DATA_FILE):
             st.divider()
