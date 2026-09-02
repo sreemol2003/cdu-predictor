@@ -1,8 +1,9 @@
 streamlit
-numpy
 pandas
+numpy
 scikit-learn
 lightgbm
 joblib
-plotly
+requests
 openpyxl
+pyarrow
