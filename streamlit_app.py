@@ -8,12 +8,24 @@ import requests
 import json
 import joblib
 from datetime import datetime
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import Ridge
+from lightgbm import LGBMRegressor
+from sklearn.multioutput import MultiOutputRegressor
+from sklearn.metrics import mean_absolute_error, r2_score
 
-# ==============================================================================
-# DATABASE SETUP & ACCESS CONTROL LAYER
-# ==============================================================================
+# --- App Config ---
+st.set_page_config(page_title="CDU Hybrid Digital Twin Platform", layout="wide")
+os.makedirs("models", exist_ok=True)
+os.makedirs("data", exist_ok=True)
+
 DB_PATH = "audit_telemetry.db"
+GUEST_MODEL_FILE = "models/guest_model.pkl"
 
+# ==============================================================================
+# DATABASE & ACCESS CONTROL SETUP
+# ==============================================================================
 def get_db_connection():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -22,8 +34,6 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     c = conn.cursor()
-    
-    # 1. Users Table
     c.execute('''
         CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
@@ -31,8 +41,6 @@ def init_db():
             role TEXT
         )
     ''')
-    
-    # 2. Access & Geolocation Logs
     c.execute('''
         CREATE TABLE IF NOT EXISTS access_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,14 +49,11 @@ def init_db():
             ip_address TEXT,
             city TEXT,
             region TEXT,
-            country TEXT,
-            duration_minutes REAL
+            country TEXT
         )
     ''')
-
-    # 3. Model Registry per User
     c.execute('''
-        CREATE TABLE IF NOT EXISTS user_models (
+        CREATE TABLE IF NOT EXISTS protected_models (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT,
             model_tag TEXT,
@@ -57,209 +62,464 @@ def init_db():
             created_at TIMESTAMP
         )
     ''')
-
-    # 4. Input & Prediction Telemetry
     c.execute('''
-        CREATE TABLE IF NOT EXISTS simulation_logs (
+        CREATE TABLE IF NOT EXISTS simulation_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT,
             timestamp TIMESTAMP,
             inputs_json TEXT,
-            predictions_json TEXT
+            outputs_json TEXT
         )
     ''')
     
-    # Create default Admin and Demo User if table is empty
-    c.execute("SELECT COUNT(*) FROM users")
-    if c.fetchone()[0] == 0:
-        admin_pw = hashlib.sha256("Admin@123".encode()).hexdigest()
-        user_pw = hashlib.sha256("User@123".encode()).hexdigest()
-        c.execute("INSERT INTO users VALUES (?, ?, ?)", ("admin", admin_pw, "admin"))
-        c.execute("INSERT INTO users VALUES (?, ?, ?)", ("engineer1", user_pw, "user"))
-    
+    # Pre-seed default accounts
+    admin_pw = hashlib.sha256("Admin@123".encode()).hexdigest()
+    user_pw = hashlib.sha256("User@123".encode()).hexdigest()
+    c.execute("INSERT OR REPLACE INTO users VALUES (?, ?, ?)", ("admin", admin_pw, "admin"))
+    c.execute("INSERT OR REPLACE INTO users VALUES (?, ?, ?)", ("engineer1", user_pw, "user"))
     conn.commit()
     conn.close()
 
 init_db()
 
-# --- Utility Functions: Auth & Geolocation ---
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
-
 def verify_login(username, password):
+    clean_u = username.strip().lower()
+    clean_p = password.strip()
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT role FROM users WHERE username = ? AND password_hash = ?", (username, hash_password(password)))
+    c.execute("SELECT role FROM users WHERE username = ? AND password_hash = ?", 
+              (clean_u, hashlib.sha256(clean_p.encode()).hexdigest()))
     row = c.fetchone()
     conn.close()
     return row["role"] if row else None
 
 def get_visitor_geo():
-    """Captures public IP address and geolocation via ipapi.co."""
     try:
-        res = requests.get("https://ipapi.co/json/", timeout=3.0).json()
+        res = requests.get("https://ipapi.co/json/", timeout=2.5).json()
         return {
-            "ip": res.get("ip", "Local/Unknown"),
+            "ip": res.get("ip", "Local/VPN"),
             "city": res.get("city", "Unknown"),
             "region": res.get("region", "Unknown"),
             "country": res.get("country_name", "Unknown")
         }
     except Exception:
-        return {"ip": "127.0.0.1", "city": "Local", "region": "Local", "country": "Local"}
+        return {"ip": "127.0.0.1", "city": "Internal", "region": "Internal", "country": "Internal"}
 
-def log_session_start(username):
+def log_login_event(username):
     geo = get_visitor_geo()
     conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('''
-        INSERT INTO access_logs (username, login_time, ip_address, city, region, country, duration_minutes)
-        VALUES (?, ?, ?, ?, ?, ?, 0.0)
+    conn.execute('''
+        INSERT INTO access_logs (username, login_time, ip_address, city, region, country)
+        VALUES (?, ?, ?, ?, ?, ?)
     ''', (username, datetime.now(), geo["ip"], geo["city"], geo["region"], geo["country"]))
     conn.commit()
-    log_id = c.lastrowid
-    conn.close()
-    return log_id
-
-def log_simulation(username, inputs, outputs):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('''
-        INSERT INTO simulation_logs (username, timestamp, inputs_json, predictions_json)
-        VALUES (?, ?, ?, ?)
-    ''', (username, datetime.now(), json.dumps(inputs), json.dumps(outputs)))
-    conn.commit()
     conn.close()
 
 # ==============================================================================
-# UI AUTHENTICATION INTERFACE
+# PHYSICS-INFORMED HYBRID ENGINE
 # ==============================================================================
-st.set_page_config(page_title="CDU Twin Enterprise", layout="wide")
+YIELD_BOUNDS = {
+    'flow_offgas': (0.005, 0.045),
+    'flow_naphtha': (0.080, 0.320),
+    'flow_kero': (0.050, 0.220),
+    'flow_lago': (0.150, 0.420),
+    'flow_residue': (0.220, 0.650)
+}
 
+PHYSICS_SLOPES = {
+    'flow_offgas': 0.00012,
+    'flow_naphtha': 0.00045,
+    'flow_kero': 0.00030,
+    'flow_lago': 0.00115,
+    'flow_residue': -0.00202
+}
+
+def density_to_api(density_val):
+    sg = density_val / 1000.0 if density_val > 10.0 else density_val
+    if sg <= 0:
+        return 30.0
+    return (141.5 / sg) - 131.5
+
+def softmax(x):
+    e_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
+    return e_x / np.sum(e_x, axis=-1, keepdims=True)
+
+class PhysicsInformedYieldModel:
+    def __init__(self):
+        self.ml_model = MultiOutputRegressor(LGBMRegressor(n_estimators=300, learning_rate=0.03, random_state=42))
+        self.linear_reg = Ridge(alpha=1.0)
+        self.scaler = StandardScaler()
+        self.flow_targets = []
+        self.baseline_stats = {}
+
+    def fit(self, X, y_yields, flow_targets, baseline_stats):
+        self.flow_targets = flow_targets
+        self.baseline_stats = baseline_stats
+        X_scaled = self.scaler.fit_transform(X)
+        self.ml_model.fit(X_scaled, y_yields)
+        logits = np.log(np.clip(y_yields.values, 1e-4, 1.0))
+        self.linear_reg.fit(X_scaled, logits)
+
+    def predict(self, X_df):
+        X_scaled = self.scaler.transform(X_df)
+        ml_preds = self.ml_model.predict(X_scaled)
+        linear_preds = softmax(self.linear_reg.predict(X_scaled))
+        base_yields = 0.70 * ml_preds + 0.30 * linear_preds
+
+        cot = X_df['cot_degC'].values if 'cot_degC' in X_df else self.baseline_stats['mean_cot']
+        fzp = X_df['flash_zone_p_kgcm2'].values if 'flash_zone_p_kgcm2' in X_df else self.baseline_stats['mean_p']
+        steam = X_df['stripping_steam_flow'].values if 'stripping_steam_flow' in X_df else self.baseline_stats['mean_steam']
+        api = X_df['crude_api'].values if 'crude_api' in X_df else self.baseline_stats.get('mean_api', 32.0)
+
+        delta_severity = (
+            (cot - self.baseline_stats['mean_cot'])
+            - 16.5 * (fzp - self.baseline_stats['mean_p'])
+            + 0.55 * (steam - self.baseline_stats['mean_steam'])
+            + 0.85 * (api - self.baseline_stats.get('mean_api', 32.0))
+        )
+
+        final_yields = np.zeros_like(base_yields)
+        for i, col in enumerate(self.flow_targets):
+            slope = PHYSICS_SLOPES.get(col, 0.0)
+            adj = base_yields[:, i] + (slope * delta_severity)
+            min_b, max_b = YIELD_BOUNDS.get(col, (0.01, 0.90))
+            final_yields[:, i] = np.clip(adj, min_b, max_b)
+
+        return final_yields / np.sum(final_yields, axis=1, keepdims=True)
+
+# ==============================================================================
+# SESSION STATE & SIDEBAR AUTHENTICATION
+# ==============================================================================
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
-    st.session_state["username"] = None
-    st.session_state["role"] = None
-    st.session_state["login_time"] = None
-    st.session_state["session_log_id"] = None
+    st.session_state["username"] = "Guest"
+    st.session_state["role"] = "guest"
+
+st.sidebar.title("🛢️ CDU Digital Twin")
 
 if not st.session_state["authenticated"]:
-    st.title("🛢️ Refinery CDU Digital Twin - Enterprise Login")
-    with st.form("login_form"):
-        u = st.text_input("Username")
-        p = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Sign In")
-        
-        if submitted:
-            role = verify_login(u, p)
+    with st.sidebar.expander("🔒 Member / Engineer Login"):
+        login_user = st.text_input("Username")
+        login_pass = st.text_input("Password", type="password")
+        if st.button("Sign In"):
+            role = verify_login(login_user, login_pass)
             if role:
                 st.session_state["authenticated"] = True
-                st.session_state["username"] = u
+                st.session_state["username"] = login_user.strip().lower()
                 st.session_state["role"] = role
-                st.session_state["login_time"] = datetime.now()
-                st.session_state["session_log_id"] = log_session_start(u)
-                st.success(f"Welcome, {u} ({role.upper()})")
+                log_login_event(login_user)
                 st.rerun()
             else:
-                st.error("Invalid Username or Password")
-    st.stop()
+                st.error("Invalid credentials.")
+else:
+    st.sidebar.success(f"Signed in as: **{st.session_state['username']}** ({st.session_state['role'].upper()})")
+    if st.sidebar.button("Log Out"):
+        st.session_state["authenticated"] = False
+        st.session_state["username"] = "Guest"
+        st.session_state["role"] = "guest"
+        st.rerun()
 
-# --- Sidebar Management & Dynamic Role Views ---
-st.sidebar.markdown(f"**Logged in as:** `{st.session_state['username']}` | **Role:** `{st.session_state['role'].upper()}`")
-session_mins = round((datetime.now() - st.session_state["login_time"]).total_seconds() / 60.0, 1)
-st.sidebar.caption(f"Session Active: {session_mins} mins")
+# Build dynamic menu options based on authentication
+nav_options = [
+    "1. Guest Model Training", 
+    "2. Yield Prediction",
+]
 
-if st.sidebar.button("Logout"):
-    # Update final session duration
-    if st.session_state["session_log_id"]:
-        conn = get_db_connection()
-        conn.execute("UPDATE access_logs SET duration_minutes = ? WHERE id = ?", (session_mins, st.session_state["session_log_id"]))
-        conn.commit()
-        conn.close()
-    st.session_state.clear()
-    st.rerun()
+if st.session_state["authenticated"]:
+    nav_options.append("3. Protected Workspace & History")
 
-# Build menu according to role
-menu_options = ["1. Model Training & DCS Upload", "2. Real-Time Yield Prediction", "3. My Models"]
 if st.session_state["role"] == "admin":
-    menu_options.append("🛡️ Admin Audit & Global Telemetry")
+    nav_options.append("🛡️ Admin Audit & Telemetry")
 
-page = st.sidebar.radio("Navigation", menu_options)
+page = st.sidebar.radio("Navigation", nav_options)
 
 # ==============================================================================
-# PAGE: REAL-TIME YIELD PREDICTION (WITH INPUT TELEMETRY)
+# PAGE 1: PUBLIC GUEST TRAINING (NO LOGIN NEEDED)
 # ==============================================================================
-if page == "2. Real-Time Yield Prediction":
+if page == "1. Guest Model Training":
+    st.header("⚙️ Column Data Ingestion & Model Training (Open Sandbox)")
+    st.markdown("Upload plant operating data or load a demo dataset to train the hybrid twin.")
+
+    uploaded_file = st.file_uploader("Upload DCS Historical Data (CSV or Excel)", type=["csv", "xlsx"])
+    col1, col2 = st.columns([1, 4])
+    use_synthetic = col1.button("Load Demo DCS Dataset")
+
+    if uploaded_file is not None:
+        raw_df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
+        if any("unnamed" in str(col).lower() for col in raw_df.columns):
+            raw_df.columns = raw_df.iloc[0].astype(str)
+            raw_df = raw_df[1:].reset_index(drop=True)
+        st.session_state['active_df'] = raw_df
+    elif use_synthetic:
+        np.random.seed(42)
+        n_samples = 1000
+        crude_flow = np.random.uniform(350, 450, n_samples)
+        cot = np.random.uniform(345, 375, n_samples)
+        crude_density = np.random.uniform(840, 890, n_samples)
+        api = (141.5 / (crude_density / 1000.0)) - 131.5
+        sulfur = np.random.uniform(1.2, 2.8, n_samples)
+        fzp = np.random.uniform(1.2, 1.6, n_samples)
+        steam = np.random.uniform(8, 14, n_samples)
+        lago_t = np.random.uniform(340, 365, n_samples)
+
+        top_reflux = crude_flow * 0.14 + (cot - 360) * 0.4 + np.random.normal(0, 2, n_samples)
+        kero_pa = crude_flow * 0.28 + (cot - 360) * 0.8 + np.random.normal(0, 3, n_samples)
+        lago_pa = crude_flow * 0.38 + (cot - 360) * 1.2 + np.random.normal(0, 4, n_samples)
+        top_t = 120 + 0.15 * (cot - 360) + np.random.normal(0, 1.5, n_samples)
+        btm_t = 338 + 0.65 * (cot - 360) - 0.4 * (steam - 10) + np.random.normal(0, 2, n_samples)
+
+        y_offgas = 0.02 + 0.00012 * (cot - 360) + np.random.normal(0, 0.001, n_samples)
+        y_naphtha = 0.16 + 0.00045 * (cot - 360) + np.random.normal(0, 0.003, n_samples)
+        y_kero = 0.12 + 0.00030 * (cot - 360) + np.random.normal(0, 0.003, n_samples)
+        y_lago = 0.28 + 0.00115 * (cot - 360) + np.random.normal(0, 0.004, n_samples)
+        y_residue = 1.0 - (y_offgas + y_naphtha + y_kero + y_lago)
+
+        st.session_state['active_df'] = pd.DataFrame({
+            'crude_flow': crude_flow, 'crude_density': crude_density, 'crude_api': api,
+            'sulfur_wt_pct': sulfur, 'cot_degC': cot, 'flash_zone_p_kgcm2': fzp,
+            'stripping_steam_flow': steam, 'lago_d86_95_degC': lago_t,
+            'top_reflux_flow_tph': top_reflux, 'kero_pa_flow_tph': kero_pa, 'lago_pa_flow_tph': lago_pa,
+            'top_temp_degC': top_t, 'bottom_residue_temp_degC': btm_t,
+            'flow_offgas': y_offgas * crude_flow, 'flow_naphtha': y_naphtha * crude_flow,
+            'flow_kero': y_kero * crude_flow, 'flow_lago': y_lago * crude_flow,
+            'flow_residue': y_residue * crude_flow
+        })
+
+    if 'active_df' in st.session_state:
+        df = st.session_state['active_df']
+        st.subheader("Data Preview")
+        st.dataframe(df.head(5), use_container_width=True)
+
+        # Mapping
+        default_inputs = ['crude_flow', 'crude_api', 'sulfur_wt_pct', 'cot_degC', 'flash_zone_p_kgcm2', 'stripping_steam_flow', 'lago_d86_95_degC']
+        default_flows = ['flow_offgas', 'flow_naphtha', 'flow_kero', 'flow_lago', 'flow_residue']
+        default_states = ['top_reflux_flow_tph', 'kero_pa_flow_tph', 'lago_pa_flow_tph', 'top_temp_degC', 'bottom_residue_temp_degC']
+
+        c1, c2, c3 = st.columns(3)
+        input_cols = c1.multiselect("Inputs (X)", list(df.columns), default=[c for c in default_inputs if c in df.columns])
+        flow_cols = c2.multiselect("Product Flows (Y1)", list(df.columns), default=[c for c in default_flows if c in df.columns])
+        state_cols = c3.multiselect("Internal States (Y2)", list(df.columns), default=[c for c in default_states if c in df.columns])
+        crude_col = c1.selectbox("Crude Inlet Flow Tag", list(df.columns), index=list(df.columns).index('crude_flow') if 'crude_flow' in df.columns else 0)
+
+        # Destination selector
+        save_as_protected = False
+        model_version_tag = "guest_model"
+        if st.session_state["authenticated"]:
+            st.divider()
+            c_save1, c_save2 = st.columns([1, 2])
+            save_as_protected = c_save1.checkbox("Save into Protected Member Vault", value=True)
+            if save_as_protected:
+                model_version_tag = c_save2.text_input("Protected Model Tag / Name", value=f"{st.session_state['username']}_model_v1")
+
+        if st.button("🚀 Train Digital Twin", type="primary"):
+            with st.spinner("Training Physics-Informed Digital Twin..."):
+                all_needed = list(set(input_cols + flow_cols + state_cols + [crude_col]))
+                clean_df = df[all_needed].apply(pd.to_numeric, errors='coerce').dropna()
+
+                total_out = clean_df[flow_cols].sum(axis=1)
+                valid_df = clean_df[np.abs(total_out - clean_df[crude_col]) / clean_df[crude_col] < 0.05].copy()
+
+                if valid_df.empty:
+                    st.error("❌ Mass balance error: Data does not close within 5%.")
+                    st.stop()
+
+                yield_targets = valid_df[flow_cols].div(valid_df[crude_col], axis=0)
+                X_tr, X_te, yf_tr, yf_te, ys_tr, ys_te, c_tr, c_te = train_test_split(
+                    valid_df[input_cols], yield_targets, valid_df[state_cols], valid_df[crude_col], test_size=0.2, random_state=42
+                )
+
+                baseline_stats = {
+                    'mean_cot': float(valid_df['cot_degC'].mean()) if 'cot_degC' in valid_df.columns else 350.0,
+                    'mean_p': float(valid_df['flash_zone_p_kgcm2'].mean()) if 'flash_zone_p_kgcm2' in valid_df.columns else 1.40,
+                    'mean_steam': float(valid_df['stripping_steam_flow'].mean()) if 'stripping_steam_flow' in valid_df.columns else 10.0,
+                    'mean_api': float(valid_df['crude_api'].mean()) if 'crude_api' in valid_df.columns else 32.0
+                }
+
+                yield_model = PhysicsInformedYieldModel()
+                yield_model.fit(X_tr, yf_tr, flow_cols, baseline_stats)
+
+                scaler_states = StandardScaler()
+                model_states = MultiOutputRegressor(LGBMRegressor(n_estimators=300, learning_rate=0.03, random_state=42))
+                model_states.fit(scaler_states.fit_transform(X_tr), ys_tr)
+
+                pipeline = {
+                    "yield_model": yield_model,
+                    "model_states": model_states,
+                    "scaler_states": scaler_states,
+                    "input_cols": input_cols,
+                    "flow_targets": flow_cols,
+                    "state_targets": state_cols,
+                    "crude_col": crude_col,
+                    "baseline_stats": baseline_stats,
+                    "training_rows": len(valid_df),
+                    "last_known_inputs": clean_df[input_cols].iloc[-1].to_dict()
+                }
+
+                if save_as_protected and st.session_state["authenticated"]:
+                    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    save_path = f"models/protected_{st.session_state['username']}_{timestamp_str}.pkl"
+                    joblib.dump(pipeline, save_path)
+                    
+                    conn = get_db_connection()
+                    conn.execute('''
+                        INSERT INTO protected_models (username, model_tag, model_path, training_rows, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (st.session_state["username"], model_version_tag, save_path, len(valid_df), datetime.now()))
+                    conn.commit()
+                    conn.close()
+                    st.success(f"🔒 Model saved exclusively to your private vault: `{model_version_tag}`")
+                else:
+                    joblib.dump(pipeline, GUEST_MODEL_FILE)
+                    st.success("🌐 Trained model saved to public guest sandbox.")
+
+# ==============================================================================
+# PAGE 2: PREDICTION INTERFACE
+# ==============================================================================
+elif page == "2. Yield Prediction":
     st.header("🎯 Autonomous CDU Prediction")
-    st.markdown("Enter boundary operating conditions. Every simulation run is logged for compliance.")
 
-    col1, col2, col3 = st.columns(3)
-    cot = col1.number_input("Furnace COT (°C)", value=358.5)
-    fzp = col2.number_input("Flash Zone Pressure (kg/cm²)", value=1.45)
-    feed = col3.number_input("Crude Flow (t/h)", value=410.0)
+    # Select model source
+    active_pipeline = None
+    if st.session_state["authenticated"]:
+        conn = get_db_connection()
+        user_models = conn.execute("SELECT id, model_tag, model_path FROM protected_models WHERE username = ?", 
+                                   (st.session_state["username"],)).fetchall()
+        conn.close()
 
-    if st.button("Run Simulation & Predict", type="primary"):
-        # Prediction calculation placeholder
-        inputs_payload = {"cot_degC": cot, "flash_zone_p_kgcm2": fzp, "crude_flow": feed}
-        outputs_payload = {
-            "flow_offgas": round(feed * 0.021, 2),
-            "flow_naphtha": round(feed * 0.165, 2),
-            "flow_kero": round(feed * 0.123, 2),
-            "flow_lago": round(feed * 0.282, 2),
-            "flow_residue": round(feed * 0.409, 2)
-        }
-        
-        # Save exact user input and calculated yields to database
-        log_simulation(st.session_state["username"], inputs_payload, outputs_payload)
-        
-        st.success("Prediction complete and execution telemetry archived.")
-        st.write("### Predicted Product Mass Rates (t/h):")
-        st.json(outputs_payload)
+        source_choice = st.radio("Choose Model to Predict With:", ["Public Guest Sandbox Model", "My Private Vault Models"], horizontal=True)
+        if source_choice == "My Private Vault Models" and user_models:
+            chosen = st.selectbox("Select Your Model", options=user_models, format_func=lambda x: x["model_tag"])
+            if chosen and os.path.exists(chosen["model_path"]):
+                active_pipeline = joblib.load(chosen["model_path"])
+        else:
+            if os.path.exists(GUEST_MODEL_FILE):
+                active_pipeline = joblib.load(GUEST_MODEL_FILE)
+    else:
+        if os.path.exists(GUEST_MODEL_FILE):
+            active_pipeline = joblib.load(GUEST_MODEL_FILE)
+
+    if not active_pipeline:
+        st.warning("⚠️ No trained model found. Please train a model on Page 1 first.")
+    else:
+        input_cols = active_pipeline["input_cols"]
+        flow_targets = active_pipeline["flow_targets"]
+        state_targets = active_pipeline["state_targets"]
+        last_in = active_pipeline.get("last_known_inputs", {})
+        stats = active_pipeline["baseline_stats"]
+
+        st.subheader("Operating Boundary Parameters")
+        input_data = {}
+        cols = st.columns(3)
+        for i, feat in enumerate(input_cols):
+            fallback = last_in.get(feat, 360.0 if "cot" in feat.lower() else (400.0 if "crude" in feat.lower() else 1.4))
+            input_data[feat] = cols[i % 3].number_input(feat, value=float(fallback), format="%.2f")
+
+        if st.button("🔮 Run Simulation & Predict", type="primary"):
+            input_df = pd.DataFrame([input_data])
+            norm_yields = active_pipeline["yield_model"].predict(input_df)[0]
+            crude_in = input_data[active_pipeline["crude_col"]]
+            pred_flows = norm_yields * crude_in
+
+            scaled_state = active_pipeline["scaler_states"].transform(input_df)
+            pred_states = active_pipeline["model_states"].predict(scaled_state)[0]
+
+            # Dynamic thermal shifts
+            cot_delta = input_data.get('cot_degC', 350.0) - stats['mean_cot']
+            for k, s in enumerate(state_targets):
+                if "bottom_residue_temp" in s.lower():
+                    pred_states[k] += 0.65 * cot_delta
+                elif "top_temp" in s.lower():
+                    pred_states[k] += 0.15 * cot_delta
+                elif "pa" in s.lower():
+                    pred_states[k] += 0.80 * cot_delta
+
+            # Log simulation if authenticated
+            if st.session_state["authenticated"]:
+                conn = get_db_connection()
+                conn.execute('''
+                    INSERT INTO simulation_history (username, timestamp, inputs_json, outputs_json)
+                    VALUES (?, ?, ?, ?)
+                ''', (st.session_state["username"], datetime.now(), json.dumps(input_data), json.dumps(dict(zip(flow_targets, pred_flows)))))
+                conn.commit()
+                conn.close()
+
+            # Display
+            c_left, c_right = st.columns(2)
+            with c_left:
+                st.subheader("📦 Product Recovery Yields")
+                st.table(pd.DataFrame({
+                    "Cut Stream": flow_targets,
+                    "Yield (wt%)": [f"{y*100:.2f}%" for y in norm_yields],
+                    "Rate (t/h)": [f"{f:.2f}" for f in pred_flows]
+                }))
+                st.metric("Total Mass Out", f"{np.sum(pred_flows):.2f} t/h")
+
+            with c_right:
+                st.subheader("🌡️ Internal Column Profile")
+                st.table(pd.DataFrame({
+                    "Parameter": state_targets,
+                    "Predicted Value": [f"{v:.2f} {'°C' if 'temp' in n.lower() else 't/h'}" for n, v in zip(state_targets, pred_states)]
+                }))
 
 # ==============================================================================
-# PAGE: MY MODELS (ROLE-FILTERED VIEW)
+# PAGE 3: PROTECTED WORKSPACE (MEMBER EXCLUSIVE)
 # ==============================================================================
-elif page == "3. My Models":
-    st.header(f"📦 Models Created by `{st.session_state['username']}`")
+elif page == "3. Protected Workspace & History":
+    st.header(f"🔒 Protected Workspace: `{st.session_state['username']}`")
     conn = get_db_connection()
-    
-    # Regular users only see their own models
-    my_models = pd.read_sql_query(
-        "SELECT model_tag, training_rows, created_at FROM user_models WHERE username = ?",
-        conn, params=(st.session_state['username'],)
-    )
+
+    tab_my_models, tab_my_sims = st.tabs(["📁 My Saved Models", "📜 My Simulation History"])
+
+    with tab_my_models:
+        st.subheader("Your Isolated Models")
+        my_models = pd.read_sql_query(
+            "SELECT id, model_tag, training_rows, created_at, model_path FROM protected_models WHERE username = ? ORDER BY created_at DESC",
+            conn, params=(st.session_state['username'],)
+        )
+        if my_models.empty:
+            st.info("No protected models saved yet. Train one on Page 1 while signed in.")
+        else:
+            st.dataframe(my_models, use_container_width=True)
+
+    with tab_my_sims:
+        st.subheader("Your Saved Simulations")
+        my_sims = pd.read_sql_query(
+            "SELECT timestamp, inputs_json, outputs_json FROM simulation_history WHERE username = ? ORDER BY timestamp DESC",
+            conn, params=(st.session_state['username'],)
+        )
+        if my_sims.empty:
+            st.info("No logged simulations on record.")
+        else:
+            st.dataframe(my_sims, use_container_width=True)
+
     conn.close()
 
-    if my_models.empty:
-        st.info("No custom models saved under your user account yet.")
-    else:
-        st.dataframe(my_models, use_container_width=True)
-
 # ==============================================================================
-# PAGE: ADMIN AUDIT & GLOBAL TELEMETRY (ADMIN EXCLUSIVE)
+# PAGE 4: ADMIN AUDIT & TELEMETRY (ADMIN EXCLUSIVE)
 # ==============================================================================
-elif page == "🛡️ Admin Audit & Global Telemetry":
+elif page == "🛡️ Admin Audit & Telemetry":
     st.header("🛡️ Global Enterprise Telemetry & User Audit")
     conn = get_db_connection()
 
-    tab_access, tab_sims, tab_all_models = st.tabs([
-        "📍 Access, Location & Durations", 
-        "📝 All Inputted Data Logs", 
-        "🗂️ Global Models (All Users)"
+    tab_logs, tab_all_models, tab_all_sims = st.tabs([
+        "📍 Visitor IP & Geolocation Logs",
+        "🗂️ Global Models (All Users)",
+        "📝 All User Runs"
     ])
 
-    with tab_access:
-        st.subheader("User Login Geolocation & Session Lengths")
-        access_df = pd.read_sql_query("SELECT username, login_time, ip_address, city, region, country, duration_minutes FROM access_logs ORDER BY login_time DESC", conn)
-        st.dataframe(access_df, use_container_width=True)
-
-    with tab_sims:
-        st.subheader("Historical Inputs & Predictions (Audit Trail)")
-        sims_df = pd.read_sql_query("SELECT id, username, timestamp, inputs_json, predictions_json FROM simulation_logs ORDER BY timestamp DESC", conn)
-        st.dataframe(sims_df, use_container_width=True)
+    with tab_logs:
+        st.subheader("Logins & Physical Locations")
+        logs_df = pd.read_sql_query("SELECT * FROM access_logs ORDER BY login_time DESC", conn)
+        st.dataframe(logs_df, use_container_width=True)
 
     with tab_all_models:
-        st.subheader("Master List of All Uploaded Models")
-        all_models_df = pd.read_sql_query("SELECT * FROM user_models ORDER BY created_at DESC", conn)
-        st.dataframe(all_models_df, use_container_width=True)
+        st.subheader("All Models Across All Engineers")
+        all_models = pd.read_sql_query("SELECT * FROM protected_models ORDER BY created_at DESC", conn)
+        st.dataframe(all_models, use_container_width=True)
+
+    with tab_all_sims:
+        st.subheader("Global Simulation History")
+        all_sims = pd.read_sql_query("SELECT * FROM simulation_history ORDER BY timestamp DESC", conn)
+        st.dataframe(all_sims, use_container_width=True)
 
     conn.close()
