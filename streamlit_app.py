@@ -424,15 +424,26 @@ elif page == "2. Yield Prediction":
     active_pipeline = None
     if st.session_state["authenticated"]:
         conn = get_db_connection()
-        user_models = conn.execute("SELECT id, model_tag, model_path FROM protected_models WHERE username = ?", 
-                                   (st.session_state["username"],)).fetchall()
+        user_models_df = pd.read_sql_query(
+            "SELECT id, model_tag, model_path FROM protected_models WHERE username = ?",
+            conn, params=(st.session_state["username"],)
+        )
         conn.close()
 
         source_choice = st.radio("Prediction Model Source:", ["Public Guest Sandbox Model", "My Private Vault Models"], horizontal=True)
-        if source_choice == "My Private Vault Models" and user_models:
-            chosen = st.selectbox("Select Private Model", options=user_models, format_func=lambda x: x["model_tag"])
-            if chosen and os.path.exists(chosen["model_path"]):
-                active_pipeline = joblib.load(chosen["model_path"])
+        
+        if source_choice == "My Private Vault Models":
+            if user_models_df.empty:
+                st.warning("⚠️ You don't have any models saved in your private vault yet. Train one on Page 1 first!")
+            else:
+                tag_to_path = dict(zip(user_models_df["model_tag"], user_models_df["model_path"]))
+                selected_tag = st.selectbox("Select Your Model", options=list(tag_to_path.keys()))
+                chosen_path = tag_to_path[selected_tag]
+                
+                if chosen_path and os.path.exists(chosen_path):
+                    active_pipeline = joblib.load(chosen_path)
+                else:
+                    st.error("❌ Model file not found on disk.")
         else:
             if os.path.exists(GUEST_MODEL_FILE):
                 active_pipeline = joblib.load(GUEST_MODEL_FILE)
